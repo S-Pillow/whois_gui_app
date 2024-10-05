@@ -1,251 +1,277 @@
 import sys
-import time
+from PyQt5.QtWidgets import (
+    QApplication, QWidget, QVBoxLayout, QPushButton, QTextEdit, QProgressBar,
+    QFileDialog, QTableWidget, QTableWidgetItem, QMessageBox, QCheckBox, QHBoxLayout
+)
+from PyQt5.QtCore import QThread, pyqtSignal, Qt
 import whois
+import csv
 import socket
-import csv  # Importing the csv module
-from PyQt5 import QtWidgets, QtCore
+import time
 
-class WhoisLookupApp(QtWidgets.QWidget):
+
+class WhoisLookupThread(QThread):
+    progress_signal = pyqtSignal(int)
+    result_signal = pyqtSignal(str, str, str, str, str)
+
+    def __init__(self, domains, include_domain, include_registrar, include_registrant, include_status):
+        super().__init__()
+        self.domains = domains
+        self.include_domain = include_domain
+        self.include_registrar = include_registrar
+        self.include_registrant = include_registrant
+        self.include_status = include_status
+
+    def run(self):
+        for domain in self.domains:
+            domain, registrar, registrant_name, status_string_gui, status_string_csv = self.perform_whois_lookup(domain)
+            self.result_signal.emit(domain, registrar, registrant_name, status_string_gui, status_string_csv)
+            self.progress_signal.emit(1)  # Emit progress increment by 1
+
+    def perform_whois_lookup(self, domain, timeout=10, retries=5, delay_between_requests=1):
+        """Perform WHOIS lookup for a single domain with retry logic and delay"""
+        for attempt in range(retries):
+            try:
+                socket.setdefaulttimeout(timeout)
+                w = whois.whois(domain)
+
+                # Get the registrar and registrant name from the response
+                registrar = w.registrar if w.registrar else "Registrar not found"
+                registrant_name = w.get('registrant_name', "Registrant contact not disclosed")
+
+                # Get the statuses and ensure they're formatted correctly
+                statuses = w.get('status', ["No status found"])
+                if isinstance(statuses, list):
+                    # Trim each status and store them in a list
+                    trimmed_statuses = [status.split("#")[-1] for status in statuses]
+                else:
+                    trimmed_statuses = [statuses.split("#")[-1]]
+
+                # Create status strings for GUI and CSV
+                status_string_gui = "\n".join(trimmed_statuses)  # For GUI (newlines)
+                status_string_csv = ", ".join(trimmed_statuses)  # For CSV (commas)
+
+                # Handle redacted data
+                if "REDACTED" in registrant_name or "not disclosed" in registrant_name.lower():
+                    registrant_name = "REDACTED FOR PRIVACY"
+
+                # Introduce a delay between requests
+                time.sleep(delay_between_requests)  # Delay between requests
+                return domain, registrar, registrant_name, status_string_gui, status_string_csv
+
+            except (whois.parser.PywhoisError, socket.timeout):
+                if attempt < retries - 1:
+                    # Exponential backoff on failure
+                    time.sleep(2 ** attempt)
+                    continue
+                return domain, "Lookup failed", "Registrant contact not found", "No status found", "No status found"
+            except Exception as e:
+                return domain, f"Error: {str(e)}", "Registrant contact not found", "No status found", "No status found"
+
+
+class WhoisLookupApp(QWidget):
     def __init__(self):
         super().__init__()
-        self.domains = []
-        self.results = []
 
-        # Set up the GUI components
-        self.init_ui()
+        # Window setup
+        self.setWindowTitle("WHOIS Lookup Tool")
+        self.setGeometry(100, 100, 800, 600)
 
-    def init_ui(self):
-        # Set default window size
-        self.setGeometry(100, 100, 800, 600)  # Set a default window width of 800 and height of 600
+        # Layout setup
+        self.layout = QVBoxLayout()
 
-        # Set up the layout
-        layout = QtWidgets.QVBoxLayout()
+        # Domain input area
+        self.text_area = QTextEdit(self)
+        self.text_area.setPlaceholderText("Enter domain names (one per line)...")
+        self.layout.addWidget(self.text_area)
 
-        # Text area for domain input
-        self.text_area = QtWidgets.QPlainTextEdit(self)
-        self.text_area.setPlaceholderText("Enter domains here, one per line...")
-        layout.addWidget(self.text_area)
+        # Checkboxes for columns
+        self.checkbox_layout = QHBoxLayout()
+        self.domain_checkbox = QCheckBox("Domain Name", self)
+        self.domain_checkbox.setChecked(True)
+        self.checkbox_layout.addWidget(self.domain_checkbox)
 
-        # Horizontal layout for checkboxes
-        checkbox_layout = QtWidgets.QHBoxLayout()
+        self.registrar_checkbox = QCheckBox("Registrar", self)
+        self.registrar_checkbox.setChecked(True)
+        self.checkbox_layout.addWidget(self.registrar_checkbox)
 
-        # Checkboxes for selecting WHOIS fields
-        self.checkbox_domain = QtWidgets.QCheckBox("Domain Name", self)
-        self.checkbox_domain.setChecked(True)
-        self.checkbox_registrar = QtWidgets.QCheckBox("Registrar", self)
-        self.checkbox_registrar.setChecked(True)
-        self.checkbox_registrant = QtWidgets.QCheckBox("Registrant Name", self)
-        self.checkbox_registrant.setChecked(True)
+        self.registrant_checkbox = QCheckBox("Registrant Name", self)
+        self.registrant_checkbox.setChecked(True)
+        self.checkbox_layout.addWidget(self.registrant_checkbox)
 
-        # Add checkboxes to the horizontal layout
-        checkbox_layout.addWidget(self.checkbox_domain)
-        checkbox_layout.addWidget(self.checkbox_registrar)
-        checkbox_layout.addWidget(self.checkbox_registrant)
+        self.status_checkbox = QCheckBox("Status", self)
+        self.status_checkbox.setChecked(True)
+        self.checkbox_layout.addWidget(self.status_checkbox)
 
-        # Add checkbox layout to the main layout
-        layout.addLayout(checkbox_layout)
+        self.layout.addLayout(self.checkbox_layout)
 
-        # Button to load domains from file
-        self.file_button = QtWidgets.QPushButton("Load Domains from File", self)
+        # Buttons
+        self.file_button = QPushButton("Load Domains from File", self)
         self.file_button.clicked.connect(self.load_domains)
-        layout.addWidget(self.file_button)
+        self.layout.addWidget(self.file_button)
 
-        # Button to start lookup
-        self.lookup_button = QtWidgets.QPushButton("Start WHOIS Lookup", self)
+        self.lookup_button = QPushButton("Start WHOIS Lookup", self)
         self.lookup_button.clicked.connect(self.start_lookup)
-        layout.addWidget(self.lookup_button)
+        self.layout.addWidget(self.lookup_button)
 
         # Progress bar
-        self.progress_bar = QtWidgets.QProgressBar(self)
-        layout.addWidget(self.progress_bar)
+        self.progress = QProgressBar(self)
+        self.layout.addWidget(self.progress)
 
-        # Table to display results
-        self.results_table = QtWidgets.QTableWidget(self)
-        layout.addWidget(self.results_table)
+        # Table for results
+        self.table = QTableWidget(self)
+        self.layout.addWidget(self.table)
 
-        # Button to clear input and results
-        self.clear_button = QtWidgets.QPushButton("Clear Input and Results", self)
+        # Buttons for clearing and saving
+        self.clear_button = QPushButton("Clear Input and Results", self)
         self.clear_button.clicked.connect(self.clear_text)
-        layout.addWidget(self.clear_button)
+        self.layout.addWidget(self.clear_button)
 
-        # Button to save results to CSV
-        self.save_button = QtWidgets.QPushButton("Save Results to CSV", self)
+        self.save_button = QPushButton("Save Results to CSV", self)
         self.save_button.clicked.connect(self.save_results)
-        layout.addWidget(self.save_button)
+        self.save_button.setEnabled(False)  # Disable until results are available
+        self.layout.addWidget(self.save_button)
 
-        # Set the layout to the QWidget
-        self.setLayout(layout)
-        self.setWindowTitle("WHOIS Lookup Tool")
+        # Set layout
+        self.setLayout(self.layout)
+
+        # Initialize state variables
+        self.domains = []
+        self.results = []
+        self.threads = []  # List to hold threads
 
     def clear_text(self):
-        """Clear the input and results text boxes."""
+        """Clear the input and results text boxes"""
         self.text_area.clear()
-        self.results_table.setRowCount(0)
+        self.table.setRowCount(0)
+        self.results = []
+        self.progress.setValue(0)
+        self.save_button.setEnabled(False)
 
     def load_domains(self):
-        """Load domain names from a text file."""
-        options = QtWidgets.QFileDialog.Options()
-        file_path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Open Domain List", "",
-                                                            "Text Files (*.txt);;All Files (*)", options=options)
+        """Load domain names from a text file"""
+        file_path, _ = QFileDialog.getOpenFileName(self, "Open Domain List", "", "Text files (*.txt)")
         if file_path:
-            with open(file_path, "r", encoding='utf-8') as f:
+            with open(file_path, "r", encoding="utf-8") as f:
                 self.domains = [line.strip() for line in f.readlines() if line.strip()]
             self.text_area.setPlainText("\n".join(self.domains))
 
     def start_lookup(self):
-        """Trigger the WHOIS lookup process."""
+        """Trigger the WHOIS lookup process"""
         self.domains = self.text_area.toPlainText().splitlines()
         self.domains = [domain.strip() for domain in self.domains if domain.strip()]
 
         if not self.domains:
-            QtWidgets.QMessageBox.critical(self, "Error", "Please enter or load domain names.")
+            QMessageBox.critical(self, "Error", "Please enter or load domain names.")
             return
 
         self.results = []
-        self.results_table.setRowCount(0)
-        self.progress_bar.setValue(0)
-        self.progress_bar.setMaximum(len(self.domains))
+        self.progress.setValue(0)
+        self.progress.setMaximum(len(self.domains))
 
-        # Determine which checkboxes are selected
-        self.selected_fields = {
-            "domain": self.checkbox_domain.isChecked(),
-            "registrar": self.checkbox_registrar.isChecked(),
-            "registrant": self.checkbox_registrant.isChecked()
-        }
-
-        # Set up the table headers based on selected checkboxes
-        self.setup_table_headers()
-
-        # Perform WHOIS lookup in batches
-        self.worker = WhoisWorker(self.domains, self.selected_fields)
-        self.worker.update_table_signal.connect(self.update_results)
-        self.worker.update_progress_signal.connect(self.update_progress)
-        self.worker.finished.connect(self.on_lookup_finished)
-
+        self.save_button.setEnabled(False)
         self.lookup_button.setEnabled(False)
-        self.worker.start()
 
-    def setup_table_headers(self):
-        """Set up the table headers based on selected fields."""
+        # Clear previous results in the table
+        self.table.setRowCount(0)
+
+        # Set table columns based on checked boxes
         headers = []
-        if self.selected_fields["domain"]:
-            headers.append("Domain Name")
-        if self.selected_fields["registrar"]:
+        if self.domain_checkbox.isChecked():
+            headers.append("Domain")
+        if self.registrar_checkbox.isChecked():
             headers.append("Registrar")
-        if self.selected_fields["registrant"]:
+        if self.registrant_checkbox.isChecked():
             headers.append("Registrant Name")
+        if self.status_checkbox.isChecked():
+            headers.append("Status")
 
-        self.results_table.setColumnCount(len(headers))
-        self.results_table.setHorizontalHeaderLabels(headers)
+        self.table.setColumnCount(len(headers))
+        self.table.setHorizontalHeaderLabels(headers)
 
-    def update_results(self, data):
-        """Update the results table with new lookup info."""
-        row_position = self.results_table.rowCount()
-        self.results_table.insertRow(row_position)
+        # Start thread for lookup
+        thread = WhoisLookupThread(
+            self.domains,
+            self.domain_checkbox.isChecked(),
+            self.registrar_checkbox.isChecked(),
+            self.registrant_checkbox.isChecked(),
+            self.status_checkbox.isChecked(),
+        )
+        thread.result_signal.connect(self.update_results)
+        thread.progress_signal.connect(self.update_progress)
+        thread.finished.connect(self.on_lookup_finished)
+        self.threads.append(thread)
+        thread.start()
 
-        column = 0
-        if self.selected_fields["domain"]:
-            self.results_table.setItem(row_position, column, QtWidgets.QTableWidgetItem(data["domain"]))
-            column += 1
-        if self.selected_fields["registrar"]:
-            self.results_table.setItem(row_position, column, QtWidgets.QTableWidgetItem(data["registrar"]))
-            column += 1
-        if self.selected_fields["registrant"]:
-            self.results_table.setItem(row_position, column, QtWidgets.QTableWidgetItem(data["registrant"]))
+    def update_results(self, domain, registrar, registrant_name, status_string_gui, status_string_csv):
+        """Update the table with new lookup info"""
+        # Store the CSV status string for later use
+        self.results.append((domain, registrar, registrant_name, status_string_csv))
 
-    def update_progress(self, progress_value):
-        """Update the progress bar."""
-        self.progress_bar.setValue(progress_value)
+        row_position = self.table.rowCount()
+        self.table.insertRow(row_position)
+        col_position = 0
+
+        if self.domain_checkbox.isChecked():
+            self.table.setItem(row_position, col_position, QTableWidgetItem(domain))
+            col_position += 1
+        if self.registrar_checkbox.isChecked():
+            self.table.setItem(row_position, col_position, QTableWidgetItem(registrar))
+            col_position += 1
+        if self.registrant_checkbox.isChecked():
+            self.table.setItem(row_position, col_position, QTableWidgetItem(registrant_name))
+            col_position += 1
+        if self.status_checkbox.isChecked():
+            item = QTableWidgetItem(status_string_gui)
+            item.setTextAlignment(Qt.AlignLeft | Qt.AlignTop)
+            self.table.setItem(row_position, col_position, item)
+            self.table.resizeRowToContents(row_position)
+        self.table.resizeColumnsToContents()
+
+    def update_progress(self, value):
+        """Update progress bar"""
+        self.progress.setValue(self.progress.value() + value)
 
     def on_lookup_finished(self):
-        """Re-enable the lookup button once lookup is done."""
+        """Called when lookup is finished"""
+        self.save_button.setEnabled(True)
         self.lookup_button.setEnabled(True)
 
     def save_results(self):
-        """Save the lookup results to a CSV file."""
-        options = QtWidgets.QFileDialog.Options()
-        file_path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Save Results to CSV", "",
-                                                            "CSV Files (*.csv);;All Files (*)", options=options)
+        """Save the lookup results to a CSV file"""
+        file_path, _ = QFileDialog.getSaveFileName(self, "Save Results to CSV", "", "CSV files (*.csv)")
         if file_path:
-            with open(file_path, "w", newline='', encoding='utf-8') as csvfile:
+            with open(file_path, "w", newline="", encoding="utf-8") as csvfile:
                 writer = csv.writer(csvfile)
                 headers = []
-                if self.selected_fields["domain"]:
-                    headers.append("Domain Name")
-                if self.selected_fields["registrar"]:
+                if self.domain_checkbox.isChecked():
+                    headers.append("Domain")
+                if self.registrar_checkbox.isChecked():
                     headers.append("Registrar")
-                if self.selected_fields["registrant"]:
+                if self.registrant_checkbox.isChecked():
                     headers.append("Registrant Name")
+                if self.status_checkbox.isChecked():
+                    headers.append("Status")
                 writer.writerow(headers)
-                for i in range(self.results_table.rowCount()):
-                    row = []
-                    if self.selected_fields["domain"]:
-                        row.append(self.results_table.item(i, 0).text())
-                    if self.selected_fields["registrar"]:
-                        row.append(self.results_table.item(i, 1).text())
-                    if self.selected_fields["registrant"]:
-                        row.append(self.results_table.item(i, 2).text())
-                    writer.writerow(row)
-            QtWidgets.QMessageBox.information(self, "Success", f"Results saved to {file_path}")
 
-class WhoisWorker(QtCore.QThread):
-    update_table_signal = QtCore.pyqtSignal(dict)
-    update_progress_signal = QtCore.pyqtSignal(int)
+                for result in self.results:
+                    row_data = []
+                    if self.domain_checkbox.isChecked():
+                        row_data.append(result[0])
+                    if self.registrar_checkbox.isChecked():
+                        row_data.append(result[1])
+                    if self.registrant_checkbox.isChecked():
+                        row_data.append(result[2])
+                    if self.status_checkbox.isChecked():
+                        row_data.append(result[3])  # status_string_csv
+                    writer.writerow(row_data)
 
-    def __init__(self, domains, selected_fields, batch_size=20, delay_between_batches=10):
-        super().__init__()
-        self.domains = domains
-        self.selected_fields = selected_fields
-        self.batch_size = batch_size
-        self.delay_between_batches = delay_between_batches
+            QMessageBox.information(self, "Success", f"Results saved to {file_path}")
 
-    def run(self):
-        """Run the WHOIS lookup in batches."""
-        total_domains = len(self.domains)
-        num_batches = (total_domains + self.batch_size - 1) // self.batch_size  # Calculate the number of batches
 
-        for batch_num in range(num_batches):
-            # Get the current batch of domains
-            start_index = batch_num * self.batch_size
-            end_index = min(start_index + self.batch_size, total_domains)
-            batch_domains = self.domains[start_index:end_index]
-
-            # Perform the lookup for the current batch
-            for domain in batch_domains:
-                data = self.perform_whois_lookup(domain)
-                self.update_table_signal.emit(data)
-                progress_value = start_index + batch_domains.index(domain) + 1
-                self.update_progress_signal.emit(progress_value)
-
-            # Introduce a delay between batches to avoid rate-limiting
-            if batch_num < num_batches - 1:  # Avoid delay after the last batch
-                time.sleep(self.delay_between_batches)
-
-    def perform_whois_lookup(self, domain, timeout=10):
-        """Perform WHOIS lookup for a single domain with a timeout."""
-        try:
-            socket.setdefaulttimeout(timeout)
-            w = whois.whois(domain)
-
-            data = {}
-            if self.selected_fields["domain"]:
-                data["domain"] = domain
-            if self.selected_fields["registrar"]:
-                data["registrar"] = w.registrar or "Registrar not found"
-            if self.selected_fields["registrant"]:
-                data["registrant"] = w.get('registrant_name', "Registrant contact not found")
-
-            return data
-        except Exception as e:
-            return {
-                "domain": domain,
-                "registrar": "Error during WHOIS lookup",
-                "registrant": f"Error: {str(e)}"
-            }
-
-# Main loop for the PyQt app
+# Main entry point for the application
 if __name__ == "__main__":
-    app = QtWidgets.QApplication(sys.argv)
+    app = QApplication(sys.argv)
     window = WhoisLookupApp()
     window.show()
     sys.exit(app.exec_())
